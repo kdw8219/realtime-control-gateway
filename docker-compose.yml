@@ -1,0 +1,12 @@
+version: '3.9'
+services:
+  realtime-control-gateway:
+    expose:
+      - "8001"
+    ports:
+      - "8001:8080"
+    container_name: realtime_control_gateway
+    image: ghcr.io/kdw8219/realtime-control-gateway:latest
+    env_file:
+      - ./env/prd/realtime-control-gateway.env
+    
