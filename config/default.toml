@@ -1,0 +1,7 @@
+[websocket_server]
+self_ip = "localhost"
+self_port = "8080"
+
+[grpc_client]
+to_ip = "localhost"
+to_port = "50051"
