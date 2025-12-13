@@ -1,34 +1,78 @@
-use crate::protocol::robot::control::robot_control_service_client::RobotControlServiceClient;
-use crate::protocol::robot::signaling::robot_signal_service_client::RobotSignalServiceClient;
+use futures_util::Stream;
+use tonic::transport::Channel;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tonic::Status;
 
-pub struct GrpcClientHandler {
-    pub to_ip: String,
-    pub to_port: String,
-    pub control_client: Option<RobotControlServiceClient<tonic::transport::Channel>>,
-    pub signal_client: Option<RobotSignalServiceClient<tonic::transport::Channel>>,
+
+use crate::protocol::{
+    robot::control::robot_control_service_client::RobotControlServiceClient,
+    robot::signaling::robot_signal_service_client::RobotSignalServiceClient,
+    robot::signaling::SignalMessage,
+    robot::control::{CommandRequest, CommandResponse},
+};
+
+pub struct GrpcClient {
+    control: RobotControlServiceClient<Channel>,
+    signal: RobotSignalServiceClient<Channel>,
 }
 
-impl GrpcClientHandler {
-    pub async fn connect(&mut self) -> anyhow::Result<()> {
+impl GrpcClient {
+    pub async fn connect(addr: String) -> anyhow::Result<Self> {
+        let channel = tonic::transport::Endpoint::from_shared(addr)?.connect().await?;
+        
+        let control = RobotControlServiceClient::new(channel.clone());
+        let signal = RobotSignalServiceClient::new(channel); //둘 중 하나는 원본을 써도...
 
-        let addr = format!("http://{}:{}"
-        , self.to_ip
-        , self.to_port
-        );
+        Ok(Self {
+            control,
+            signal,
+        })
+    }
 
-        let channel = tonic::transport::Channel::from_shared(addr)?
-            .connect()
+    pub async fn open_signal_stream(
+        &self,
+        robot_id: String,
+    ) -> anyhow::Result<(
+        mpsc::UnboundedSender<SignalMessage>,
+        impl Stream<Item = Result<SignalMessage, Status>>,
+    )> {
+        // client → robot 송신 채널
+        let (tx, rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let outbound = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        
+        let response = self
+            .signal
+            .clone()
+            .open_signal_stream(outbound)
             .await?;
 
-        let control_client = RobotControlServiceClient::new(channel.clone());
-        let signal_client = RobotSignalServiceClient::new(channel.clone());
-        self.control_client = Some(control_client);
-        self.signal_client = Some(signal_client);
-        Ok(())
+        let inbound = response.into_inner();
+
+        // 첫 메시지로 "세션 시작" 알림 (선택)
+        tx.send(SignalMessage {
+            robot_id,
+            payload: None,
+        })?;
+
+        Ok((tx, inbound))
     }
 
-    pub async fn handle_request(&self) -> anyhow::Result<()> {
-        // Implementation goes here
-        Ok(())
+    pub async fn send_command(
+        &self,
+        req: CommandRequest,
+    ) -> anyhow::Result<CommandResponse> {
+        let resp = self
+            .control
+            .clone()
+            .send_command(req)
+            .await?
+            .into_inner();
+
+        Ok(resp)
     }
+
 }
+
+
+
