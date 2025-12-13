@@ -8,7 +8,8 @@ use tonic::Status;
 use crate::protocol::{
     robot::control::robot_control_service_client::RobotControlServiceClient,
     robot::signaling::robot_signal_service_client::RobotSignalServiceClient,
-    robot::signaling::SignalMessage
+    robot::signaling::SignalMessage,
+    robot::control::{CommandRequest, CommandResponse},
 };
 
 pub struct GrpcClient {
@@ -21,7 +22,7 @@ impl GrpcClient {
         let channel = tonic::transport::Endpoint::from_shared(addr)?.connect().await?;
         
         let control = RobotControlServiceClient::new(channel.clone());
-        let signal = RobotSignalServiceClient::new(channel.clone());
+        let signal = RobotSignalServiceClient::new(channel); //둘 중 하나는 원본을 써도...
 
         Ok(Self {
             control,
@@ -38,13 +39,12 @@ impl GrpcClient {
     )> {
         // client → robot 송신 채널
         let (tx, rx) = mpsc::unbounded_channel::<SignalMessage>();
-
         let outbound = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         
         let response = self
             .signal
             .clone()
-            .signal(outbound)
+            .open_signal_stream(outbound)
             .await?;
 
         let inbound = response.into_inner();
@@ -58,33 +58,18 @@ impl GrpcClient {
         Ok((tx, inbound))
     }
 
-    pub async fn send_control(
+    pub async fn send_command(
         &self,
-        robot_id: String,
-        command: String,
-        payload: Value,
-    ) -> anyhow::Result<Value> {
-        // 실제 구현
-        Ok(serde_json::json!({"status": "ok"}))
-    }
+        req: CommandRequest,
+    ) -> anyhow::Result<CommandResponse> {
+        let resp = self
+            .control
+            .clone()
+            .send_command(req)
+            .await?
+            .into_inner();
 
-    pub async fn signal(
-        &self,
-        robot_id: String,
-        sig_type: String,
-        payload: Value,
-    ) -> anyhow::Result<()> {
-    
-        Ok(())
-    }
-
-    pub async fn subscribe_signal(
-        &self,
-        robot_id: String,
-    ) -> anyhow::Result<impl Stream<Item = Result<SignalMessage, tonic::Status>>> {
-        let req = tonic::Request::new(crate::protocol::robot::signaling::SignalMessage { robot_id, payload:None });
-        let stream = self.signal.clone().subscribe(req).await?.into_inner();
-        Ok(stream)
+        Ok(resp)
     }
 
 }

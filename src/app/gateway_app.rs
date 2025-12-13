@@ -13,7 +13,7 @@ pub struct GatewayApp {
 
 impl GatewayApp {
     pub async fn new(grpc_endpoint: String) -> anyhow::Result<Self> {
-        let grpc = GrpcClient::connect(grpc_endpoint).await?;
+        let grpc = GrpcClient::connect(grpc_endpoint).await?; //grpc 연결은 하나면 됨
         let grpc = Arc::new(grpc);
 
         let sessions: SharedSessions =
