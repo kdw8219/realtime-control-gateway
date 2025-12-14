@@ -3,7 +3,7 @@ use tonic::transport::Channel;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tonic::Status;
-
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::protocol::{
     robot::control::robot_control_service_client::RobotControlServiceClient,
@@ -13,49 +13,38 @@ use crate::protocol::{
 };
 
 pub struct GrpcClient {
-    control: RobotControlServiceClient<Channel>,
-    signal: RobotSignalServiceClient<Channel>,
+    pub control: RobotControlServiceClient<Channel>,
+    pub signal_tx: mpsc::UnboundedSender<SignalMessage>,
 }
 
 impl GrpcClient {
-    pub async fn connect(addr: String) -> anyhow::Result<Self> {
+    pub async fn connect(addr: String) -> anyhow::Result<(Self, impl Stream<Item = Result<SignalMessage, tonic::Status>>)> {
         let channel = tonic::transport::Endpoint::from_shared(addr)?.connect().await?;
         
-        let control = RobotControlServiceClient::new(channel.clone());
-        let signal = RobotSignalServiceClient::new(channel); //둘 중 하나는 원본을 써도...
+        let mut signal =
+            RobotSignalServiceClient::new(channel.clone());
 
-        Ok(Self {
-            control,
-            signal,
-        })
-    }
+        let control =
+            RobotControlServiceClient::new(channel);
 
-    pub async fn open_signal_stream(
-        &self,
-        robot_id: String,
-    ) -> anyhow::Result<(
-        mpsc::UnboundedSender<SignalMessage>,
-        impl Stream<Item = Result<SignalMessage, Status>>,
-    )> {
-        // client → robot 송신 채널
+        // Gateway → grpc-robot-api
         let (tx, rx) = mpsc::unbounded_channel::<SignalMessage>();
-        let outbound = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-        
-        let response = self
-            .signal
-            .clone()
+        let outbound = UnboundedReceiverStream::new(rx);
+
+        // open shared bidi-stream (1회)
+        let response = signal
             .open_signal_stream(outbound)
             .await?;
 
         let inbound = response.into_inner();
 
-        // 첫 메시지로 "세션 시작" 알림 (선택)
-        tx.send(SignalMessage {
-            robot_id,
-            payload: None,
-        })?;
-
-        Ok((tx, inbound))
+        Ok((
+            Self {
+                control: control,
+                signal_tx: tx,
+            },
+            inbound,
+        ))
     }
 
     pub async fn send_command(
