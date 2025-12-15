@@ -2,51 +2,51 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use crate::protocol::grpc::GrpcClient;
-use crate::session::manager::{ SharedSessions};
+use crate::session::manager::SharedSessions;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
 use crate::protocol::robot::signaling::SignalMessage;
 use crate::domain::signal::WsSignalMessage;
 
 pub struct WebSocketHandler {
-    grpc: Arc<crate::protocol::grpc::GrpcClient>,
+    grpc: Arc<GrpcClient>,
     sessions: SharedSessions,
 }
 
 impl WebSocketHandler {
-    pub fn new(
-        grpc: Arc<GrpcClient>,
-        sessions: SharedSessions,
-    ) -> Self {
+    pub fn new(grpc: Arc<GrpcClient>, sessions: SharedSessions) -> Self {
         Self { grpc, sessions }
     }
 
-    pub async fn handle_connection(
-        &self,
-        stream: TcpStream,
-    ) -> anyhow::Result<()> {
-
+    pub async fn handle_connection(&self, stream: TcpStream) -> anyhow::Result<()> {
         let ws_stream = accept_async(stream).await?;
-        let (mut ws_sink, mut ws_stream) = ws_stream.split();
+        let (ws_sink, mut ws_stream) = ws_stream.split();
 
-        //get robot id from json
+        // 첫 메시지로 robot_id 확보
         let robot_id = match ws_stream.next().await {
             Some(Ok(Message::Text(text))) => {
-                let v: serde_json::Value = serde_json::from_str(&text)?;
-                v["robot_id"].as_str().unwrap().to_string()
+                let v: serde_json::Value = serde_json::from_str(text.as_str())?;
+                v["robot_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("robot_id missing in first message"))?
+                    .to_string()
             }
             _ => anyhow::bail!("robot_id not provided"),
         };
 
-        let (ws_tx, mut ws_rx) =
-            mpsc::unbounded_channel::<SignalMessage>();
+        // 세션별 WS 송신 큐 (gRPC inbound 라우팅 대상)
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<SignalMessage>();
 
         {
             let mut guard = self.sessions.write().await;
             guard.insert(robot_id.clone(), ws_tx);
         }
 
-        //let mut ws_sink_clone = ws_sink.clone();
+        // gRPC signal stream이 아직 없으면 지금(최초) 오픈 + inbound receiver spawn
+        self.grpc.ensure_signal_stream(self.sessions.clone()).await?;
+
+        // WS로 내려보내는 task (SignalMessage -> WsSignalMessage -> JSON)
         tokio::spawn(async move {
             let mut ws_sink = ws_sink;
 
@@ -73,22 +73,22 @@ impl WebSocketHandler {
             }
         });
 
-        // 6️⃣ WS → gRPC 처리 루프
+        // WS -> gRPC (WsSignalMessage -> SignalMessage -> signal_tx send)
         while let Some(Ok(msg)) = ws_stream.next().await {
             match msg {
                 Message::Text(text) => {
-                    let s = text.as_str();
-                    let ws_msg: WsSignalMessage = serde_json::from_str(s)?;
+                    let ws_msg: WsSignalMessage = serde_json::from_str(text.as_str())?;
                     let signal: SignalMessage = ws_msg.try_into()?;
-                    let _ = self.grpc.signal_tx.send(signal);
-                }
 
+                    // ensure_signal_stream을 이미 호출했으므로 sender는 존재
+                    let _ = self.grpc.signal_sender()?.send(signal);
+                }
                 Message::Close(_) => break,
                 _ => {}
             }
         }
 
-        // 7️⃣ 연결 종료 → 세션 정리
+        // 세션 제거
         {
             let mut guard = self.sessions.write().await;
             guard.remove(&robot_id);
