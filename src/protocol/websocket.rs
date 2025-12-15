@@ -6,6 +6,7 @@ use crate::session::manager::{ SharedSessions};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use crate::protocol::robot::signaling::SignalMessage;
+use crate::domain::signal::WsSignalMessage;
 
 pub struct WebSocketHandler {
     grpc: Arc<crate::protocol::grpc::GrpcClient>,
@@ -50,7 +51,22 @@ impl WebSocketHandler {
             let mut ws_sink = ws_sink;
 
             while let Some(msg) = ws_rx.recv().await {
-                let json = serde_json::to_string(&msg).unwrap();
+                let ws_msg = match WsSignalMessage::try_from(msg) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("convert error: {e}");
+                        break;
+                    }
+                };
+
+                let json = match serde_json::to_string(&ws_msg) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("serde error: {e}");
+                        break;
+                    }
+                };
+
                 if ws_sink.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
@@ -61,11 +77,9 @@ impl WebSocketHandler {
         while let Some(Ok(msg)) = ws_stream.next().await {
             match msg {
                 Message::Text(text) => {
-                    // signaling 예시
-                    let signal: SignalMessage =
-                        serde_json::from_str(&text)?;
-
-                    // 이미 열린 shared stream으로 send
+                    let s = text.as_str();
+                    let ws_msg: WsSignalMessage = serde_json::from_str(s)?;
+                    let signal: SignalMessage = ws_msg.try_into()?;
                     let _ = self.grpc.signal_tx.send(signal);
                 }
 

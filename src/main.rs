@@ -2,6 +2,7 @@ mod protocol;
 mod config;
 mod app;
 mod session;
+mod domain;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
