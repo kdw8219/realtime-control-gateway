@@ -27,11 +27,14 @@ impl GatewayApp {
         loop {
             let (stream, _) = listener.accept().await?;
 
+            println!("receive request! from: {:?}", stream.peer_addr());
+
             let grpc = self.grpc.clone();
             let sessions = self.sessions.clone();
 
             tokio::spawn(async move {
                 let handler = WebSocketHandler::new(grpc, sessions);
+                println!("make websocket handler");
 
                 if let Err(e) = handler.handle_connection(stream).await {
                     eprintln!("WebSocket error: {:?}", e);
