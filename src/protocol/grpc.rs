@@ -1,8 +1,8 @@
 use futures_util::StreamExt;
 use tonic::transport::{Channel, Endpoint};
 use tokio::sync::{mpsc, Mutex, OnceCell};
-use tonic::Status;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use log::{info, warn, error, debug};
 
 use crate::session::manager::SharedSessions;
 
@@ -77,13 +77,13 @@ impl GrpcClient {
                         }
                     }
                     Err(e) => {
-                        eprintln!("gRPC inbound stream error: {:?}", e);
+                        error!("gRPC inbound stream error: {:?}", e);
                         break;
                     }
                 }
             }
 
-            eprintln!("gRPC signaling stream closed");
+            error!("gRPC signaling stream closed");
         });
 
         Ok(())
