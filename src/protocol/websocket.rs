@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::protocol::robot::signaling::SignalMessage;
 use crate::domain::signal::WsSignalMessage;
+use log::{info, warn, error, debug};
 
 pub struct WebSocketHandler {
     grpc: Arc<GrpcClient>,
@@ -54,7 +55,7 @@ impl WebSocketHandler {
                 let ws_msg = match WsSignalMessage::try_from(msg) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("convert error: {e}");
+                        error!("convert error: {e}");
                         break;
                     }
                 };
@@ -62,11 +63,11 @@ impl WebSocketHandler {
                 let json = match serde_json::to_string(&ws_msg) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("serde error: {e}");
+                        error!("serde error: {e}");
                         break;
                     }
                 };
-
+                
                 if ws_sink.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
@@ -79,7 +80,8 @@ impl WebSocketHandler {
                 Message::Text(text) => {
                     let ws_msg: WsSignalMessage = serde_json::from_str(text.as_str())?;
                     let signal: SignalMessage = ws_msg.try_into()?;
-
+                    
+                    info!("send request to grpc");
                     // ensure_signal_stream을 이미 호출했으므로 sender는 존재
                     let _ = self.grpc.signal_sender()?.send(signal);
                 }
