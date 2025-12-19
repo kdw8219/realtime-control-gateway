@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// WebSocket <-> Gateway control 메시지
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,4 +74,25 @@ pub enum WsControlResponse {
         robot_id: String,
         message: String,
     },
+}
+
+/// 클라이언트 → Gateway 제어 요청 형태 (raw JSON)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRequestType {
+    Move,
+    Stop,
+    EStop,
+    SetSpeed,
+    Dock,
+    PathFollow,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ControlRequest {
+    #[serde(rename = "type")]
+    pub kind: ControlRequestType,
+
+    #[serde(default)]
+    pub payload: Value,
 }

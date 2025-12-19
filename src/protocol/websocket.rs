@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -13,6 +12,7 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
+use crate::domain::control::{ControlRequest, ControlRequestType};
 use crate::domain::signal::{CommandType, ControlPayload, WsSignalMessage};
 use crate::protocol::grpc::GrpcClient;
 use crate::protocol::robot::signaling::SignalMessage;
@@ -46,13 +46,13 @@ impl WebSocketHandler {
         .await?;
 
         let path = path_rx.await.unwrap_or_else(|_| "/".to_string());
-        println!("[ws] handshake peer={peer} path={path}");
+        log::info!("[ws] handshake peer={peer} path={path}");
 
         if let Some(robot_id) = extract_robot_id(&path, "/ws/screen/") {
-            println!("[ws] route=screen robot_id={robot_id}");
+            log::info!("[ws] route=screen robot_id={robot_id}");
             self.handle_screen_channel(robot_id, ws_stream).await
         } else if let Some(robot_id) = extract_robot_id(&path, "/ws/control/") {
-            println!("[ws] route=control robot_id={robot_id}");
+            log::info!("[ws] route=control robot_id={robot_id}");
             self.handle_control_channel(robot_id, ws_stream).await
         } else {
             anyhow::bail!("unsupported websocket path: {path}");
@@ -64,6 +64,7 @@ impl WebSocketHandler {
         robot_id: String,
         ws_stream: WebSocketStream<TcpStream>,
     ) -> anyhow::Result<()> {
+        log::info!("[screen] handle_screen_channel enter robot_id={robot_id}");
         let (ws_sink, mut ws_stream) = ws_stream.split();
 
         // gRPC -> WS 송신 큐 (WebRTC signaling)
@@ -74,18 +75,31 @@ impl WebSocketHandler {
             guard.insert(robot_id.clone(), ws_tx);
         }
 
-        // gRPC signal stream이 아직 없으면 지금(최초) 오픈 + inbound receiver spawn
-        if let Err(e) = self.grpc.ensure_signal_stream(self.sessions.clone()).await {
-            let mut guard = self.sessions.write().await;
-            guard.remove(&robot_id);
-            return Err(e);
+        // gRPC signal stream 준비를 비동기로 시도 (WS 수신은 막지 않음)
+        {
+            let grpc = self.grpc.clone();
+            let sessions = self.sessions.clone();
+            let rid = robot_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = grpc.ensure_signal_stream(sessions).await {
+                    log::error!("[screen] async ensure signaling stream failed for {rid}: {e:?}");
+                } else {
+                    log::info!("[screen] signaling stream ready for {rid}");
+                }
+            });
         }
 
         // WS로 내려보내는 task (SignalMessage -> WsSignalMessage -> JSON)
+        let robot_id_for_task = robot_id.clone();
         tokio::spawn(async move {
             let mut ws_sink = ws_sink;
 
             while let Some(msg) = ws_rx.recv().await {
+                log::info!(
+                    "[screen] outbound to client robot_id={}: {:?}",
+                    robot_id_for_task,
+                    msg.payload
+                );
                 let ws_msg = match WsSignalMessage::try_from(msg) {
                     Ok(v) => v,
                     Err(e) => {
@@ -112,11 +126,24 @@ impl WebSocketHandler {
         while let Some(Ok(msg)) = ws_stream.next().await {
             match msg {
                 Message::Text(text) => {
+                    log::info!("[screen] inbound text from client robot_id={}: {text}", robot_id);
                     let ws_msg: WsSignalMessage = serde_json::from_str(text.as_str())?;
                     let signal: SignalMessage = ws_msg.try_into()?;
 
-                    // ensure_signal_stream을 이미 호출했으므로 sender는 존재
-                    let _ = self.grpc.signal_sender()?.send(signal);
+                    match self.grpc.signal_sender() {
+                        Ok(sender) => {
+                            if let Err(e) = sender.send(signal) {
+                                log::warn!("[screen] failed to send signal to gRPC for {}: {}", robot_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[screen] gRPC signal sender not ready for {}: {} (will keep WS open)",
+                                robot_id,
+                                e
+                            );
+                        }
+                    }
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -137,22 +164,24 @@ impl WebSocketHandler {
         robot_id: String,
         ws_stream: WebSocketStream<TcpStream>,
     ) -> anyhow::Result<()> {
+        log::info!("[control] handle_control_channel enter robot_id={robot_id}");
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-        // Control도 signaling stream을 통해 robot-api로 전달한다.
-        if let Err(e) = self.grpc.ensure_signal_stream(self.sessions.clone()).await {
-            eprintln!(
-                "[control] failed to ensure signaling stream for {robot_id}: {e}"
-            );
-            let _ = send_control_error(
-                &mut ws_sink,
-                "signaling stream not ready; command not processed",
-            )
-            .await;
-            return Err(e);
+        // Control도 signaling stream을 통해 robot-api로 전달한다. (비동기 준비)
+        {
+            let grpc = self.grpc.clone();
+            let sessions = self.sessions.clone();
+            let rid = robot_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = grpc.ensure_signal_stream(sessions).await {
+                    log::error!("[control] async ensure signaling stream failed for {rid}: {e:?}");
+                } else {
+                    log::info!("[control] signaling stream ready for {rid}");
+                }
+            });
         }
 
-        println!("[control] ws connected for robot_id={robot_id}, signaling stream ready");
+        log::info!("[control] ws connected for robot_id={robot_id}, signaling stream ready");
         if let Err(e) = send_control_ack(&mut ws_sink, "control channel ready").await {
             eprintln!("[control] failed to send ready ack for {robot_id}: {e}");
         }
@@ -160,7 +189,7 @@ impl WebSocketHandler {
         while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    println!("[control] recv raw text for {robot_id}: {text}");
+                    log::info!("[control] recv raw text for {robot_id}: {text}");
 
                     let ws_signal = match parse_control_request(&text, &robot_id) {
                         Ok(msg) => msg,
@@ -171,11 +200,11 @@ impl WebSocketHandler {
                         }
                     };
 
-                    println!("[control] parsed WsSignalMessage for {robot_id}: {:?}", ws_signal);
+                    log::info!("[control] parsed WsSignalMessage for {robot_id}: {:?}", ws_signal);
 
                     match SignalMessage::try_from(ws_signal) {
                         Ok(signal) => {
-                            println!(
+                            log::info!(
                                 "[control] mapped to SignalMessage for {robot_id}: {:?}",
                                 signal.payload
                             );
@@ -183,7 +212,7 @@ impl WebSocketHandler {
                             let sender = match self.grpc.signal_sender() {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    eprintln!(
+                                    log::warn!(
                                         "[control] signal sender missing for {robot_id}: {e}"
                                     );
                                     let _ = send_control_error(
@@ -191,7 +220,7 @@ impl WebSocketHandler {
                                         "signaling sender unavailable",
                                     )
                                     .await;
-                                    break;
+                                    continue;
                                 }
                             };
 
@@ -205,7 +234,7 @@ impl WebSocketHandler {
                                 break;
                             }
 
-                            println!("[control] sent to gRPC channel for {robot_id}");
+                            log::info!("[control] sent to gRPC channel for {robot_id}");
                             if let Err(e) = send_control_ack(&mut ws_sink, "command accepted").await {
                                 eprintln!("[control] failed to send ack to client for {robot_id}: {e}");
                             }
@@ -224,11 +253,11 @@ impl WebSocketHandler {
                     }
                 }
                 Ok(Message::Close(frame)) => {
-                    println!("[control] close frame for {robot_id}: {:?}", frame);
+                    log::info!("[control] close frame for {robot_id}: {:?}", frame);
                     break;
                 }
                 Ok(other) => {
-                    println!("[control] ignore ws message for {robot_id}: {:?}", other);
+                    log::info!("[control] ignore ws message for {robot_id}: {:?}", other);
                 }
                 Err(e) => {
                     eprintln!("[control] websocket error for {robot_id}: {e}");
@@ -241,26 +270,6 @@ impl WebSocketHandler {
 
         Ok(())
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ControlRequestType {
-    Move,
-    Stop,
-    EStop,
-    SetSpeed,
-    Dock,
-    PathFollow,
-}
-
-#[derive(Debug, Deserialize)]
-struct ControlRequest {
-    #[serde(rename = "type")]
-    kind: ControlRequestType,
-
-    #[serde(default)]
-    payload: Value,
 }
 
 fn parse_control_request(text: &str, robot_id: &str) -> anyhow::Result<WsSignalMessage> {
