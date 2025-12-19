@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-/// WebSocket <-> Gateway signaling 메시지
+/* ============================
+ * WebSocket <-> Gateway Signal
+ * ============================ */
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WsSignalMessage {
+    /* ---------- WebRTC ---------- */
+
     #[serde(rename = "screen_request")]
     ScreenRequest {
         robot_id: String,
@@ -38,7 +43,61 @@ pub enum WsSignalMessage {
         robot_id: String,
         error: String,
     },
+
+    /* ---------- Control ---------- */
+
+    #[serde(rename = "control_command")]
+    ControlCommand {
+        robot_id: String,
+        command: CommandType,
+
+        #[serde(flatten)]
+        payload: Option<ControlPayload>,
+    },
 }
+
+/* ============================
+ * Control Types
+ * ============================ */
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommandType {
+    Move,
+    Stop,
+    EmergencyStop,
+    SetSpeed,
+    Dock,
+    PathFollow,
+}
+
+/* ============================
+ * Control Payload
+ * ============================ */
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "payload_type")]
+pub enum ControlPayload {
+    #[serde(rename = "move")]
+    Move {
+        direction: String,
+        speed: f64,
+    },
+
+    #[serde(rename = "set_speed")]
+    SetSpeed {
+        speed: f64,
+    },
+
+    #[serde(rename = "path_follow")]
+    PathFollow {
+        path_id: String,
+    },
+}
+
+/* ============================
+ * WebRTC Payloads
+ * ============================ */
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WsSessionDescription {

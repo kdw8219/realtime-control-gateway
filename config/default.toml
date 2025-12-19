@@ -1,7 +1,7 @@
 [websocket_server]
-self_ip = "localhost"
-self_port = "8080"
+self_ip = "0.0.0.0"
+self_port = "8001"
 
 [grpc_client]
-to_ip = "localhost"
+to_ip = "grpc-robot-api"
 to_port = "50051"

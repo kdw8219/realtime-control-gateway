@@ -6,15 +6,12 @@ use log::{info, warn, error, debug};
 
 use crate::session::manager::SharedSessions;
 
-use crate::protocol::{
-    robot::control::robot_control_service_client::RobotControlServiceClient,
-    robot::signaling::robot_signal_service_client::RobotSignalServiceClient,
-    robot::signaling::SignalMessage,
-    robot::control::{CommandRequest, CommandResponse},
+use crate::protocol::robot::signaling::{
+    robot_signal_service_client::RobotSignalServiceClient,
+    SignalMessage,
 };
 
 pub struct GrpcClient {
-    control: RobotControlServiceClient<Channel>,
     signal: RobotSignalServiceClient<Channel>,
 
     // lazy-init된 outbound sender (Gateway -> grpc-robot-api)
@@ -29,7 +26,6 @@ impl GrpcClient {
         let channel = Endpoint::from_shared(addr)?.connect().await?;
 
         Ok(Self {
-            control: RobotControlServiceClient::new(channel.clone()),
             signal: RobotSignalServiceClient::new(channel),
             signal_tx: OnceCell::new(),
             init_lock: Mutex::new(()),
@@ -93,19 +89,5 @@ impl GrpcClient {
         self.signal_tx
             .get()
             .ok_or_else(|| anyhow::anyhow!("signal stream not initialized (call ensure_signal_stream first)"))
-    }
-
-    pub async fn send_command(
-        &self,
-        req: CommandRequest,
-    ) -> anyhow::Result<CommandResponse> {
-        let resp = self
-            .control
-            .clone()
-            .send_command(req)
-            .await?
-            .into_inner();
-
-        Ok(resp)
     }
 }
