@@ -1,9 +1,9 @@
 use futures_util::StreamExt;
+use anyhow::anyhow;
 use tonic::transport::{Channel, Endpoint};
 use tokio::sync::{mpsc, Mutex, OnceCell};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use log::{info, warn, error, debug};
-use tokio::time::{timeout, Duration};
+use log::{info, error, debug};
 
 use crate::session::manager::SharedSessions;
 
@@ -33,14 +33,28 @@ impl GrpcClient {
         })
     }
 
-    pub async fn ensure_signal_stream(&self, sessions: SharedSessions) -> anyhow::Result<()> {
-        if self.signal_tx.get().is_some() {
+    pub async fn ensure_signal_stream(
+        &self,
+        sessions: SharedSessions,
+        initial: Option<SignalMessage>,
+    ) -> anyhow::Result<()> {
+        if let Some(sender) = self.signal_tx.get() {
+            if let Some(ref msg) = initial {
+                sender
+                    .send(msg.clone())
+                    .map_err(|e| anyhow!("failed to send initial signal: {e}"))?;
+            }
             debug!("[grpc] ensure_signal_stream: already initialized");
             return Ok(());
         }
 
         let _g = self.init_lock.lock().await;
-        if self.signal_tx.get().is_some() {
+        if let Some(sender) = self.signal_tx.get() {
+            if let Some(ref msg) = initial {
+                sender
+                    .send(msg.clone())
+                    .map_err(|e| anyhow!("failed to send initial signal: {e}"))?;
+            }
             debug!("[grpc] ensure_signal_stream: already initialized (after lock)");
             return Ok(());
         }
@@ -49,15 +63,15 @@ impl GrpcClient {
 
         // Gateway -> grpc-robot-api outbound
         let (tx, rx) = mpsc::unbounded_channel::<SignalMessage>();
+        if let Some(msg) = initial {
+            tx.send(msg)
+                .map_err(|e| anyhow!("failed to send initial signal before open: {e}"))?;
+        }
         let outbound = UnboundedReceiverStream::new(rx);
 
         // 실제 RPC 호출은 여기서 발생 (lazy-init)
-        let response = match self
-            .signal
-            .clone()
-            .open_signal_stream(outbound)
-            .await
-        {
+        let mut client = self.signal.clone();
+        let response = match client.open_signal_stream(outbound).await {
             Ok(resp) => resp,
             Err(e) => {
                 error!("[grpc] failed to open signal stream: {:?}", e);

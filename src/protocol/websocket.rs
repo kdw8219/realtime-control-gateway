@@ -59,6 +59,22 @@ impl WebSocketHandler {
         }
     }
 
+    async fn init_signaling(&self, robot_id: &str) -> anyhow::Result<()> {
+        let hello = SignalMessage {
+            robot_id: robot_id.to_string(),
+            payload: None,
+        };
+
+        // Ensure the bi-di stream is open and immediately send a handshake message
+        // carrying only the robot_id so the gRPC server can bind the session.
+        self.grpc
+            .ensure_signal_stream(self.sessions.clone(), Some(hello))
+            .await?;
+        log::info!("[ws] sent initial signaling handshake for {robot_id}");
+
+        Ok(())
+    }
+
     async fn handle_screen_channel(
         &self,
         robot_id: String,
@@ -75,19 +91,14 @@ impl WebSocketHandler {
             guard.insert(robot_id.clone(), ws_tx);
         }
 
-        // gRPC signal stream 준비를 비동기로 시도 (WS 수신은 막지 않음)
-        {
-            let grpc = self.grpc.clone();
-            let sessions = self.sessions.clone();
-            let rid = robot_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = grpc.ensure_signal_stream(sessions).await {
-                    log::error!("[screen] async ensure signaling stream failed for {rid}: {e:?}");
-                } else {
-                    log::info!("[screen] signaling stream ready for {rid}");
-                }
-            });
-        }
+        // gRPC signal stream을 즉시 준비시키고 handshake 메시지를 전송
+        self.init_signaling(&robot_id)
+            .await
+            .map_err(|e| {
+                log::error!("[screen] failed to init signaling for {robot_id}: {e:?}");
+                e
+            })?;
+        log::info!("[screen] signaling stream ready for {robot_id}");
 
         // WS로 내려보내는 task (SignalMessage -> WsSignalMessage -> JSON)
         let robot_id_for_task = robot_id.clone();
@@ -168,18 +179,13 @@ impl WebSocketHandler {
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
         // Control도 signaling stream을 통해 robot-api로 전달한다. (비동기 준비)
-        {
-            let grpc = self.grpc.clone();
-            let sessions = self.sessions.clone();
-            let rid = robot_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = grpc.ensure_signal_stream(sessions).await {
-                    log::error!("[control] async ensure signaling stream failed for {rid}: {e:?}");
-                } else {
-                    log::info!("[control] signaling stream ready for {rid}");
-                }
-            });
-        }
+        self.init_signaling(&robot_id)
+            .await
+            .map_err(|e| {
+                log::error!("[control] failed to init signaling for {robot_id}: {e:?}");
+                e
+            })?;
+        log::info!("[control] signaling stream ready for {robot_id}");
 
         log::info!("[control] ws connected for robot_id={robot_id}, signaling stream ready");
         if let Err(e) = send_control_ack(&mut ws_sink, "control channel ready").await {
