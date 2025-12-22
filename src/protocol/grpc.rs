@@ -1,7 +1,8 @@
 use futures_util::StreamExt;
 use anyhow::anyhow;
 use tonic::transport::{Channel, Endpoint};
-use tokio::sync::{mpsc, Mutex, OnceCell};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use log::{info, error, debug};
 
@@ -15,8 +16,8 @@ use crate::protocol::robot::signaling::{
 pub struct GrpcClient {
     signal: RobotSignalServiceClient<Channel>,
 
-    // lazy-init된 outbound sender (Gateway -> grpc-robot-api)
-    signal_tx: OnceCell<mpsc::UnboundedSender<SignalMessage>>,
+    // lazy-init된 outbound sender (Gateway -> grpc-robot-api), 재연결 가능
+    signal_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SignalMessage>>>>,
 
     // init 경쟁 방지
     init_lock: Mutex<()>,
@@ -28,7 +29,7 @@ impl GrpcClient {
 
         Ok(Self {
             signal: RobotSignalServiceClient::new(channel),
-            signal_tx: OnceCell::new(),
+            signal_tx: Arc::new(Mutex::new(None)),
             init_lock: Mutex::new(()),
         })
     }
@@ -38,7 +39,7 @@ impl GrpcClient {
         sessions: SharedSessions,
         initial: Option<SignalMessage>,
     ) -> anyhow::Result<()> {
-        if let Some(sender) = self.signal_tx.get() {
+        if let Some(sender) = self.signal_tx.lock().await.clone() {
             if let Some(ref msg) = initial {
                 sender
                     .send(msg.clone())
@@ -49,7 +50,7 @@ impl GrpcClient {
         }
 
         let _g = self.init_lock.lock().await;
-        if let Some(sender) = self.signal_tx.get() {
+        if let Some(sender) = self.signal_tx.lock().await.clone() {
             if let Some(ref msg) = initial {
                 sender
                     .send(msg.clone())
@@ -82,10 +83,14 @@ impl GrpcClient {
         let inbound = response.into_inner();
 
         // sender 저장
-        let _ = self.signal_tx.set(tx);
+        {
+            let mut guard = self.signal_tx.lock().await;
+            *guard = Some(tx.clone());
+        }
         info!("[grpc] ensure_signal_stream: stream opened and sender stored");
 
         // inbound receiver spawn (1회)
+        let signal_tx = self.signal_tx.clone();
         tokio::spawn(async move {
             let mut inbound = Box::pin(inbound);
 
@@ -107,15 +112,20 @@ impl GrpcClient {
                 }
             }
 
-            error!("gRPC signaling stream closed");
+            error!("gRPC signaling stream closed (remote ended RPC)");
+            // 연결이 종료되면 sender를 비워 재연결을 허용
+            let mut guard = signal_tx.lock().await;
+            *guard = None;
         });
 
         Ok(())
     }
 
-    pub fn signal_sender(&self) -> anyhow::Result<&mpsc::UnboundedSender<SignalMessage>> {
+    pub async fn signal_sender(&self) -> anyhow::Result<mpsc::UnboundedSender<SignalMessage>> {
         self.signal_tx
-            .get()
+            .lock()
+            .await
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("signal stream not initialized (call ensure_signal_stream first)"))
     }
 }

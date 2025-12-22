@@ -141,19 +141,33 @@ impl WebSocketHandler {
                     let ws_msg: WsSignalMessage = serde_json::from_str(text.as_str())?;
                     let signal: SignalMessage = ws_msg.try_into()?;
 
-                    match self.grpc.signal_sender() {
-                        Ok(sender) => {
-                            if let Err(e) = sender.send(signal) {
-                                log::warn!("[screen] failed to send signal to gRPC for {}: {}", robot_id, e);
+                    let mut sent = false;
+                    // 1차 시도
+                    if let Ok(sender) = self.grpc.signal_sender().await {
+                        if sender.send(signal.clone()).is_ok() {
+                            sent = true;
+                        } else {
+                            log::warn!("[screen] failed to send signal to gRPC for {}: channel closed (retrying)", robot_id);
+                        }
+                    }
+
+                    // 재시도: 스트림 재연결 후 다시 전송
+                    if !sent {
+                        if let Err(e) = self.init_signaling(&robot_id).await {
+                            log::warn!("[screen] retry init signaling failed for {}: {}", robot_id, e);
+                        } else if let Ok(sender) = self.grpc.signal_sender().await {
+                            if sender.send(signal).is_ok() {
+                                sent = true;
+                                log::info!("[screen] resent signal after reconnect for {}", robot_id);
                             }
                         }
-                        Err(e) => {
-                            log::warn!(
-                                "[screen] gRPC signal sender not ready for {}: {} (will keep WS open)",
-                                robot_id,
-                                e
-                            );
-                        }
+                    }
+
+                    if !sent {
+                        log::warn!(
+                            "[screen] gRPC signal sender not ready for {} (will keep WS open)",
+                            robot_id
+                        );
                     }
                 }
                 Message::Close(_) => break,
@@ -215,28 +229,33 @@ impl WebSocketHandler {
                                 signal.payload
                             );
 
-                            let sender = match self.grpc.signal_sender() {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    log::warn!(
-                                        "[control] signal sender missing for {robot_id}: {e}"
-                                    );
-                                    let _ = send_control_error(
-                                        &mut ws_sink,
-                                        "signaling sender unavailable",
-                                    )
-                                    .await;
-                                    continue;
+                            let mut delivered = false;
+                            if let Ok(sender) = self.grpc.signal_sender().await {
+                                if sender.send(signal.clone()).is_ok() {
+                                    delivered = true;
+                                } else {
+                                    log::warn!("[control] gRPC channel closed for {robot_id}, retrying");
                                 }
-                            };
+                            }
 
-                            if let Err(e) = sender.send(signal) {
+                            if !delivered {
+                                if let Err(e) = self.init_signaling(&robot_id).await {
+                                    log::warn!("[control] retry init signaling failed for {robot_id}: {e}");
+                                } else if let Ok(sender) = self.grpc.signal_sender().await {
+                                    if sender.send(signal.clone()).is_ok() {
+                                        delivered = true;
+                                        log::info!("[control] resent signal after reconnect for {robot_id}");
+                                    }
+                                }
+                            }
+
+                            if !delivered {
                                 let _ = send_control_error(
                                     &mut ws_sink,
-                                    format!("failed to deliver command: {e}"),
+                                    "signaling sender unavailable",
                                 )
                                 .await;
-                                eprintln!("[control] failed to send over gRPC channel for {robot_id}: {e}");
+                                eprintln!("[control] failed to send over gRPC channel for {robot_id}");
                                 break;
                             }
 
