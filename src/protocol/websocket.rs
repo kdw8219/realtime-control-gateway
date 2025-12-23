@@ -5,10 +5,11 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{self, Duration};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{Request, Response},
-    tungstenite::Message,
+    tungstenite::{Message, Bytes},
     WebSocketStream,
 };
 
@@ -104,31 +105,53 @@ impl WebSocketHandler {
         let robot_id_for_task = robot_id.clone();
         tokio::spawn(async move {
             let mut ws_sink = ws_sink;
+            let mut ping_interval = time::interval(Duration::from_secs(20));
 
-            while let Some(msg) = ws_rx.recv().await {
-                log::info!(
-                    "[screen] outbound to client robot_id={}: {:?}",
-                    robot_id_for_task,
-                    msg.payload
-                );
-                let ws_msg = match WsSignalMessage::try_from(msg) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("convert error: {e}");
-                        break;
+            loop {
+                tokio::select! {
+                    _ = ping_interval.tick() => {
+                        if let Err(e) = ws_sink.send(Message::Ping(Bytes::new())).await {
+                            eprintln!("[screen] ping failed for {}: {}", robot_id_for_task, e);
+                            break;
+                        }
                     }
-                };
+                    msg = ws_rx.recv() => {
+                        let Some(msg) = msg else { break; };
 
-                let json = match serde_json::to_string(&ws_msg) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("serde error: {e}");
-                        break;
+                        // 서버 keepalive 등 payload가 비어 있으면 건너뛴다.
+                        if msg.payload.is_none() {
+                            log::debug!(
+                                "[screen] skip outbound with empty payload robot_id={}",
+                                robot_id_for_task
+                            );
+                            continue;
+                        }
+
+                        log::info!(
+                            "[screen] outbound to client robot_id={}: {:?}",
+                            robot_id_for_task,
+                            msg.payload
+                        );
+                        let ws_msg = match WsSignalMessage::try_from(msg) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("convert error: {e}");
+                                break;
+                            }
+                        };
+
+                        let json = match serde_json::to_string(&ws_msg) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("serde error: {e}");
+                                break;
+                            }
+                        };
+
+                        if ws_sink.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
                     }
-                };
-
-                if ws_sink.send(Message::Text(json.into())).await.is_err() {
-                    break;
                 }
             }
         });
@@ -180,6 +203,8 @@ impl WebSocketHandler {
             let mut guard = self.sessions.write().await;
             guard.remove(&robot_id);
         }
+        // WS 종료 시 gRPC signaling 스트림도 정리
+        self.grpc.close_signal_stream().await;
 
         Ok(())
     }
@@ -206,92 +231,107 @@ impl WebSocketHandler {
             eprintln!("[control] failed to send ready ack for {robot_id}: {e}");
         }
 
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    log::info!("[control] recv raw text for {robot_id}: {text}");
+        let mut ping_interval = time::interval(Duration::from_secs(20));
 
-                    let ws_signal = match parse_control_request(&text, &robot_id) {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            let _ = send_control_error(&mut ws_sink, e.to_string()).await;
-                            eprintln!("[control] parse error for {robot_id}: {e}");
-                            continue;
-                        }
-                    };
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if let Err(e) = ws_sink.send(Message::Ping(Bytes::new())).await {
+                        eprintln!("[control] ping failed for {robot_id}: {e}");
+                        break;
+                    }
+                }
+                msg = ws_stream.next() => {
+                    let Some(msg) = msg else { break; };
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            log::info!("[control] recv raw text for {robot_id}: {text}");
 
-                    log::info!("[control] parsed WsSignalMessage for {robot_id}: {:?}", ws_signal);
-
-                    match SignalMessage::try_from(ws_signal) {
-                        Ok(signal) => {
-                            log::info!(
-                                "[control] mapped to SignalMessage for {robot_id}: {:?}",
-                                signal.payload
-                            );
-
-                            let mut delivered = false;
-                            if let Ok(sender) = self.grpc.signal_sender().await {
-                                if sender.send(signal.clone()).is_ok() {
-                                    delivered = true;
-                                } else {
-                                    log::warn!("[control] gRPC channel closed for {robot_id}, retrying");
+                            let ws_signal = match parse_control_request(&text, &robot_id) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    let _ = send_control_error(&mut ws_sink, e.to_string()).await;
+                                    eprintln!("[control] parse error for {robot_id}: {e}");
+                                    continue;
                                 }
-                            }
+                            };
 
-                            if !delivered {
-                                if let Err(e) = self.init_signaling(&robot_id).await {
-                                    log::warn!("[control] retry init signaling failed for {robot_id}: {e}");
-                                } else if let Ok(sender) = self.grpc.signal_sender().await {
-                                    if sender.send(signal.clone()).is_ok() {
-                                        delivered = true;
-                                        log::info!("[control] resent signal after reconnect for {robot_id}");
+                            log::info!("[control] parsed WsSignalMessage for {robot_id}: {:?}", ws_signal);
+
+                            match SignalMessage::try_from(ws_signal) {
+                                Ok(signal) => {
+                                    log::info!(
+                                        "[control] mapped to SignalMessage for {robot_id}: {:?}",
+                                        signal.payload
+                                    );
+
+                                    let mut delivered = false;
+                                    if let Ok(sender) = self.grpc.signal_sender().await {
+                                        if sender.send(signal.clone()).is_ok() {
+                                            delivered = true;
+                                        } else {
+                                            log::warn!("[control] gRPC channel closed for {robot_id}, retrying");
+                                        }
+                                    }
+
+                                    if !delivered {
+                                        if let Err(e) = self.init_signaling(&robot_id).await {
+                                            log::warn!("[control] retry init signaling failed for {robot_id}: {e}");
+                                        } else if let Ok(sender) = self.grpc.signal_sender().await {
+                                            if sender.send(signal.clone()).is_ok() {
+                                                delivered = true;
+                                                log::info!("[control] resent signal after reconnect for {robot_id}");
+                                            }
+                                        }
+                                    }
+
+                                    if !delivered {
+                                        let _ = send_control_error(
+                                            &mut ws_sink,
+                                            "signaling sender unavailable",
+                                        )
+                                        .await;
+                                        eprintln!("[control] failed to send over gRPC channel for {robot_id}");
+                                        break;
+                                    }
+
+                                    log::info!("[control] sent to gRPC channel for {robot_id}");
+                                    if let Err(e) = send_control_ack(&mut ws_sink, "command accepted").await {
+                                        eprintln!("[control] failed to send ack to client for {robot_id}: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[control] signal conversion error for {robot_id}: {e}");
+                                    if let Err(err) = send_control_error(
+                                        &mut ws_sink,
+                                        format!("invalid control command: {e}"),
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("[control] failed to send error to client for {robot_id}: {err}");
                                     }
                                 }
                             }
-
-                            if !delivered {
-                                let _ = send_control_error(
-                                    &mut ws_sink,
-                                    "signaling sender unavailable",
-                                )
-                                .await;
-                                eprintln!("[control] failed to send over gRPC channel for {robot_id}");
-                                break;
-                            }
-
-                            log::info!("[control] sent to gRPC channel for {robot_id}");
-                            if let Err(e) = send_control_ack(&mut ws_sink, "command accepted").await {
-                                eprintln!("[control] failed to send ack to client for {robot_id}: {e}");
-                            }
+                        }
+                        Ok(Message::Close(frame)) => {
+                            log::info!("[control] close frame for {robot_id}: {:?}", frame);
+                            break;
+                        }
+                        Ok(other) => {
+                            log::info!("[control] ignore ws message for {robot_id}: {:?}", other);
                         }
                         Err(e) => {
-                            eprintln!("[control] signal conversion error for {robot_id}: {e}");
-                            if let Err(err) = send_control_error(
-                                &mut ws_sink,
-                                format!("invalid control command: {e}"),
-                            )
-                            .await
-                            {
-                                eprintln!("[control] failed to send error to client for {robot_id}: {err}");
-                            }
+                            eprintln!("[control] websocket error for {robot_id}: {e}");
+                            break;
                         }
                     }
-                }
-                Ok(Message::Close(frame)) => {
-                    log::info!("[control] close frame for {robot_id}: {:?}", frame);
-                    break;
-                }
-                Ok(other) => {
-                    log::info!("[control] ignore ws message for {robot_id}: {:?}", other);
-                }
-                Err(e) => {
-                    eprintln!("[control] websocket error for {robot_id}: {e}");
-                    break;
                 }
             }
         }
 
         println!("[control] loop finished for {robot_id}");
+        // WS 종료 시 gRPC signaling 스트림도 정리
+        self.grpc.close_signal_stream().await;
 
         Ok(())
     }
