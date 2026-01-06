@@ -44,6 +44,11 @@ pub enum WsSignalMessage {
         error: String,
     },
 
+    #[serde(rename = "heartbeat_check")]
+    HeartbeatCheck {
+        robot_id: String,
+    },
+
     /* ---------- Control ---------- */
 
     #[serde(rename = "control_command")]

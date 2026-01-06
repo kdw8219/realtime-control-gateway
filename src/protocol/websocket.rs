@@ -16,7 +16,7 @@ use tokio_tungstenite::{
 use crate::domain::control::{ControlRequest, ControlRequestType};
 use crate::domain::signal::{CommandType, ControlPayload, WsSignalMessage};
 use crate::protocol::grpc::GrpcClient;
-use crate::protocol::robot::signaling::SignalMessage;
+use crate::protocol::robot::signaling::{signal_message, Heartbeat, SignalMessage};
 use crate::session::manager::SharedSessions;
 
 type WsSink = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
@@ -171,7 +171,9 @@ impl WebSocketHandler {
                     _ = ping_interval.tick() => {
                             let ping_msg = SignalMessage {
                                 robot_id: robot_id_cloned.clone(),
-                                payload: None,
+                                payload: Some(signal_message::Payload::HeartbeatCheck(
+                                    Heartbeat {}
+                                )),
                             };
                             if grpc_stream.send(ping_msg).is_ok() {
                                 continue;
