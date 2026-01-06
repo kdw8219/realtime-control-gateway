@@ -156,11 +156,38 @@ impl WebSocketHandler {
             }
         });
 
+        // grpc로 내려보내는 ping looop
+        let grpc_cloned = self.grpc.clone();
+        let robot_id_cloned = robot_id.clone();
+        //let robot_id_cloned = robot_id.clone();
+        tokio::spawn(async move {
+            let mut ping_interval = time::interval(Duration::from_secs(20));
+            let sender = grpc_cloned.signal_sender().await.unwrap();
+            let grpc_stream = sender.clone();
+            //let robot_id = robot_id_cloned.clone();
+                    // 1차 시도
+            loop {
+                tokio::select! {
+                    _ = ping_interval.tick() => {
+                            let ping_msg = SignalMessage {
+                                robot_id: robot_id_cloned.clone(),
+                                payload: None,
+                            };
+                            if grpc_stream.send(ping_msg).is_ok() {
+                                continue;
+                            } else {
+                                log::warn!("[screen] failed to send signal to gRPC for {}: channel closed (retrying)", robot_id_cloned.clone());
+                            }
+                        }
+                }
+            }
+        });
+
         // WS -> gRPC (WsSignalMessage -> SignalMessage -> signal_tx send)
         while let Some(Ok(msg)) = ws_stream.next().await {
             match msg {
                 Message::Text(text) => {
-                    log::info!("[screen] inbound text from client robot_id={}: {text}", robot_id);
+                    log::info!("[screen] inbound text from client robot_id={}: {text}", robot_id.clone());
                     let ws_msg: WsSignalMessage = serde_json::from_str(text.as_str())?;
                     let signal: SignalMessage = ws_msg.try_into()?;
 
