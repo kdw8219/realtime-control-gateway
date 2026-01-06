@@ -14,6 +14,7 @@ use crate::protocol::robot::signaling::{
     ScreenRequest,
     SignalMessage,
     WebrtcError,
+    Heartbeat,
     CommandType as GrpcCommandType,
     MovePayload,
     SetSpeedPayload,
@@ -98,6 +99,11 @@ impl TryFrom<WsSignalMessage> for SignalMessage {
             WsSignalMessage::WebrtcError { robot_id, error } => Ok(SignalMessage {
                 robot_id,
                 payload: Some(signal_message::Payload::WebrtcError(WebrtcError { error })),
+            }),
+
+            WsSignalMessage::HeartbeatCheck { robot_id } => Ok(SignalMessage {
+                robot_id,
+                payload: Some(signal_message::Payload::HeartbeatCheck(Heartbeat {})),
             }),
 
             /* ---------- Control ---------- */
@@ -200,6 +206,10 @@ impl TryFrom<SignalMessage> for WsSignalMessage {
                     robot_id,
                     error: e.error,
                 })
+            }
+
+            Some(signal_message::Payload::HeartbeatCheck(_)) => {
+                Ok(WsSignalMessage::HeartbeatCheck { robot_id })
             }
 
             /* ---------- Control ---------- */
