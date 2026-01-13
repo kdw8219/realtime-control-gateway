@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use log::{info, error, debug};
+use tokio::task::JoinHandle;
 
 use crate::session::manager::SharedSessions;
 
@@ -21,6 +22,9 @@ pub struct GrpcClient {
 
     // init 경쟁 방지
     init_lock: Mutex<()>,
+
+    // inbound receiver task (for cancellation/cleanup)
+    signal_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl GrpcClient {
@@ -31,6 +35,7 @@ impl GrpcClient {
             signal: RobotSignalServiceClient::new(channel),
             signal_tx: Arc::new(Mutex::new(None)),
             init_lock: Mutex::new(()),
+            signal_task: Mutex::new(None),
         })
     }
 
@@ -91,7 +96,7 @@ impl GrpcClient {
 
         // inbound receiver spawn (1회)
         let signal_tx = self.signal_tx.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut inbound = Box::pin(inbound);
             let mut last_err: Option<tonic::Status> = None;
 
@@ -135,6 +140,8 @@ impl GrpcClient {
             let mut guard = signal_tx.lock().await;
             *guard = None;
         });
+        let mut task_guard = self.signal_task.lock().await;
+        *task_guard = Some(task);
 
         Ok(())
     }
@@ -155,5 +162,9 @@ impl GrpcClient {
             debug!("[grpc] closing signal stream (drop sender)");
         }
         *guard = None;
+        let mut task_guard = self.signal_task.lock().await;
+        if let Some(handle) = task_guard.take() {
+            handle.abort();
+        }
     }
 }
